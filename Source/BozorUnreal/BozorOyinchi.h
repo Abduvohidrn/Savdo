@@ -80,6 +80,10 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Bozor")
 	FVector KozSiljish = FVector(12.f, 0.f, 11.f);
 
+	// kamerada qadam tebranishining qancha qismi qoladi (X oldinga-orqaga, Y yonga, Z tik); 1 - animatsiyadagidek
+	UPROPERTY(EditAnywhere, Category = "Bozor")
+	FVector TebranishKuchi = FVector(0.5f, 0.3f, 0.6f);
+
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Bozor")
 	TObjectPtr<UCameraComponent> Kamera;
 
@@ -113,7 +117,7 @@ protected:
 private:
 	void Move(const FInputActionValue& Value);
 	void Look(const FInputActionValue& Value);
-	void KameraJoyi();
+	void KameraJoyi(float Dt);
 	void Chiqar(const FString& Kim, const FString& Matn, const FColor& Rang);
 	void SotuvTestQadami();
 
@@ -125,6 +129,10 @@ private:
 	UPROPERTY() TObjectPtr<UInputAction> IaJump;
 
 	UPROPERTY() TObjectPtr<UBozorSuhbat> Suhbat;
+
+	// boshning kapsulaga nisbatan sekin o'rtacha joyi (kamera tebranishini yumshatish uchun)
+	FVector KameraOrtacha = FVector::ZeroVector;
+	bool bKameraTayyor = false;
 
 	// -SotuvTest: o'zi yurib, tayyor suhbatni o'tkazadi va suratga oladi
 	bool bTest = false;

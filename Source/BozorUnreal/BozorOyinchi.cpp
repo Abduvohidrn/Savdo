@@ -214,7 +214,11 @@ ABozorOyinchi::ABozorOyinchi(const FObjectInitializer& ObjectInitializer)
 	bUseControllerRotationYaw = true;
 	UCharacterMovementComponent* Cm = GetCharacterMovement();
 	Cm->bOrientRotationToMovement = false;
-	Cm->MaxWalkSpeed = 220.f;
+	// yurish animatsiyasi bola masshtabida (0.66) aynan 198 sm/s qadam tashlaydi - tezlik shunga teng bo'lmasa oyoq sirpanadi
+	// (BS_Idle_Walk_Run_YangiBola1 namunalari ham 198/396 ga moslangan). Tezlanish yumshoq - bola birdan to'xtab/yurib ketmaydi
+	Cm->MaxWalkSpeed = 198.f;
+	Cm->MaxAcceleration = 1000.f;
+	Cm->BrakingDecelerationWalking = 1200.f;
 	Cm->JumpZVelocity = 380.f;
 	Cm->BrakingDecelerationFalling = 1500.f;
 	Cm->AirControl = 0.4f;
@@ -303,17 +307,28 @@ void ABozorOyinchi::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 	if (bTest) SotuvTestQadami();
-	KameraJoyi();
+	KameraJoyi(DeltaSeconds);
 }
 
 // Shablondagi kabi kamera boshda: FP warp moslagan bosh suyagi joyi + ko'z siljishi (gavda yo'nalishida).
-// Bosh suyagi masshtabi yig'ilgani uchun socket'ga biriktirilmaydi - joyi har kadr olinadi
-void ABozorOyinchi::KameraJoyi()
+// Bosh suyagi masshtabi yig'ilgani uchun socket'ga biriktirilmaydi - joyi har kadr olinadi.
+// Boshning kapsulaga nisbatan joyi ikkiga ajratiladi: sekin o'zgaradigan o'rtacha (egilish, sakrash) to'liq olinadi,
+// qadam tebranishi esa kamaytiriladi - animatsiyadagi bosh chayqalishi ko'zda keskin va noqulay sezilardi
+void ABozorOyinchi::KameraJoyi(float Dt)
 {
 	const int32 Bosh = Qollar ? Qollar->GetBoneIndex(TEXT("head")) : INDEX_NONE;
 	if (Bosh == INDEX_NONE) return;
+	const FTransform Kapsula = GetActorTransform();
+	const FVector Mahalliy = Kapsula.InverseTransformPosition(Qollar->GetBoneLocation(TEXT("head")));
+	if (!bKameraTayyor)
+	{
+		KameraOrtacha = Mahalliy;
+		bKameraTayyor = true;
+	}
+	KameraOrtacha = FMath::VInterpTo(KameraOrtacha, Mahalliy, Dt, 3.f);
+	const FVector Tebranish = (Mahalliy - KameraOrtacha) * TebranishKuchi;
 	const FRotator Yaw(0.f, GetControlRotation().Yaw, 0.f);
-	Kamera->SetWorldLocation(Qollar->GetBoneLocation(TEXT("head")) + Yaw.RotateVector(KozSiljish * (Boy / MeshBoyi)));
+	Kamera->SetWorldLocation(Kapsula.TransformPosition(KameraOrtacha + Tebranish) + Yaw.RotateVector(KozSiljish * (Boy / MeshBoyi)));
 }
 
 // ================= sotuv (chat oynasi bo'lguncha konsol orqali)

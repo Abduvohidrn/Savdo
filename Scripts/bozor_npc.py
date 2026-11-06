@@ -112,13 +112,13 @@ _BEYSBOLKA = ("Hats_Hair/SK_ma_hat_cap_01", {0: "MI_hat_cap_dark"})
 _BEYSBOLKA_J = ("Hats_Hair/SK_ma_hat_cap_01", {0: "MI_hat_cap_01_brown"})
 _SHAPKA = ("Hats_Hair/SK_ma_hat_casual_set_beanie_01_hair", {0: "MI_hat_casual-set_02_dark"})
 _SOCH = ("Hats_Hair/SK_ma_hair_03", {})
-# ro'mol: Blender/romol (romol.blend, skript bilan yasalgan, orqaga bog'langan) -> /Game/Bozor/Romol/SK_Romol;
+# ro'mol: Assets/Romol/SK_Romol.fbx -> /Game/Bozor/Romol/SK_Romol_V2;
 # naqsh/rang har bir NPC'ga indeks bo'yicha ROMOL_NAQSH dan
 _RUMOL = ("ROMOL", {})
 _RUMOL2 = ("ROMOL", {})
 ROMOL = ROOT + "/Romol/"
-ROMOL_NAQSH = ["Gulli_Qizil", "Ikat_Kok", "Nuqtali_Qora", "Paisley_Bordo", "Yolyol_Binafsha", "Gulli_Kok", "Katak_Qizil",
-               "Oq_Gulli", "Ikat_Qora", "Gulli_Yashil", "Nuqtali_Jigar", "Paisley_Yashil", "Yolyol_Qizg", "Katak_Kok"]
+ROMOL_NAQSH = ["01_Kok_Moychechak", "02_Zumrad_Atirgul", "03_Qora_Oltin",
+               "04_Sutrang_Lola", "05_Binafsha_Yulduz", "06_Bordo_Chinnigul"]
 _SOCH_Q = ("Hats_Hair/SK_fe_hair_05", {0: "MI_hair_02_dark"})
 _SOCH_Q2 = ("Hats_Hair/SK_fe_hair_01", {0: "MI_fe_hair_01_dark", 1: "MI_fe_hair_01_dark"})
 _QOL, _BILAK = "Basebody/SK_ma_hands_average", "Basebody/SK_ma_arm"
@@ -181,6 +181,24 @@ CIT_BOSH = {
 CIT_TERI = {"ma": "Basebody/MI_ma_skin_body_01_caucasian_yellow", "fe": "Basebody/MI_fe_skin_body_caucasian_yellow"}
 
 
+def romol_material_for_outfit(mesh, overrides):
+    """Match the scarf to the garment palette, with subdued cloth colors."""
+    names = {str((overrides.get(i) or slot.material_interface).get_name())
+             for i, slot in enumerate(mesh.materials)
+             if overrides.get(i) or slot.material_interface}
+    if "MI_fe_casual_purple" in names:
+        pattern = "05_Binafsha_Yulduz"
+    elif names & {"MI_fe_casual_01_dark", "MI_apron_02_brown_stripes1"}:
+        pattern = "06_Bordo_Chinnigul"
+    elif "MI_apron_02_brown" in names:
+        pattern = "03_Qora_Oltin"
+    elif "MI_fe_casual_04_dark" in names and "MI_apron_01_b_dark" not in names:
+        pattern = "03_Qora_Oltin"
+    else:
+        pattern = "01_Kok_Moychechak"
+    return load(ROMOL + "HairFit/MI_Romol_" + pattern + "_Muted")
+
+
 def cit_parts(character, role, idx):
     """Citizen to'plami: (jins, [(nom, mesh, {slot: material}), ...]) yoki None."""
     tur = CIT_TUR.get(character)
@@ -194,8 +212,11 @@ def cit_parts(character, role, idx):
     out = []
     for name, mesh, mats in parts:
         if mesh == "ROMOL":
-            out.append((name, load(ROMOL + "SK_Romol"),
-                        {0: load(ROMOL + "MI_Romol_" + ROMOL_NAQSH[(idx * 5 + 3) % len(ROMOL_NAQSH)])}))
+            _, outfit, outfit_materials = out[0]
+            out.append((name, load(ROMOL + "HairFit/SK_Romol_HairFit"),
+                        {0: romol_material_for_outfit(outfit, outfit_materials)}))
+            out.append(("Soch", load(ROMOL + "HairFit/SK_Soch_PastTugun"),
+                        {0: load(ROMOL + "HairFit/M_Soch_PastTugun")}))
             continue
         m = load(CIT + "Meshes/" + mesh)
         if not m:

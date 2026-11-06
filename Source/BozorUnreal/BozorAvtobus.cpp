@@ -124,8 +124,9 @@ void ABozorBekat::OnConstruction(const FTransform& Transform)
 	NomMatn->SetRelativeLocation(FVector(0.f, -52.f, -38.f));
 	NomMatn->SetRelativeRotation(FRotator(0.f, -90.f, 0.f));
 
-	// elektron tablo: soyabon tomi ostida, old tomonida, yo'lga qarab
-	TabloQuti->SetRelativeLocation(FVector(B.Max.X - 25.f, B.GetCenter().Y, B.Max.Z - 70.f));
+	// elektron tablo: tom ostidagi bo'ylama markaziy to'singa tegib osilgan (to'sin tagi ~ B.Max.Z - 11 sm), yo'lga qarab.
+	// Oldin tom ostida 40 sm pastda hech narsaga ulanmay havoda turardi
+	TabloQuti->SetRelativeLocation(FVector(B.GetCenter().X + 7.f, B.GetCenter().Y, B.Max.Z - 27.f));
 	TabloQuti->SetRelativeRotation(FRotator::ZeroRotator);
 	TabloQuti->SetRelativeScale3D(FVector(0.06f, 1.1f, 0.32f));
 	TabloMatn->SetRelativeScale3D(FVector(1.f / 0.06f, 1.f / 1.1f, 1.f / 0.32f));
@@ -356,7 +357,15 @@ void ABozorAvtobusIntro::Eshiklar(bool bOch)
 		UE_LOG(LogBozorAvtobus, Warning, TEXT("[Avtobus] Doors hodisasi topilmadi"));
 		return;
 	}
-	for (int32 Eshik = 0; Eshik < 3; ++Eshik)
+	// eshiklar soni = MeshArray_Doors / 2 (har eshikda 2 tavaqa). Bo'g'imsiz avtobusda 2 ta eshik bor;
+	// mavjud bo'lmagan eshikni ochish BP'da "Accessed None ... Array_Get_Item" xatolarini beradi
+	int32 Soni = 2;
+	if (FArrayProperty* AP = FindFProperty<FArrayProperty>(Avtobus->GetClass(), TEXT("MeshArray_Doors")))
+	{
+		FScriptArrayHelper H(AP, AP->ContainerPtrToValuePtr<void>(Avtobus));
+		Soni = H.Num() / 2;
+	}
+	for (int32 Eshik = 0; Eshik < Soni; ++Eshik)
 	{
 		TArray<uint8> Buf;
 		Buf.SetNumZeroed(FMath::Max<int32>(F->ParmsSize, 1));
