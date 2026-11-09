@@ -20,6 +20,7 @@
 #include "Misc/CommandLine.h"
 #include "NavigationSystem.h"
 #include "Navigation/PathFollowingComponent.h"
+#include "Navigation/CrowdFollowingComponent.h"
 #include "TimerManager.h"
 #include "TwoBoneIK.h"
 #include "UnrealClient.h"
@@ -42,6 +43,17 @@ namespace
 
 	// Unity Mathf.Clamp: chegaralar teskari bo'lsa ham yiqilmaydi
 	float SafeClamp(float X, float Lo, float Hi) { return FMath::Clamp(X, Lo, FMath::Max(Lo, Hi)); }
+
+	// DetourCrowd NavMesh chetiga (poldagi mol, rasta burchagi) radiusidan yaqin kelgan agentni teskari tomonga tortib,
+	// joyida aylantirib qo'yadi: tezlik 0-5 sm/s, 11-28 s (2026-11-09, sinovda tasdiqlandi - steering o'chsa darhol yuradi).
+	// Shunda crowd steering vaqtincha o'chiriladi, agent oddiy yo'l bo'yicha chiqib ketadi
+	void SetCrowdSteering(AAIController* C, bool bOn)
+	{
+		if (UCrowdFollowingComponent* CF = C ? Cast<UCrowdFollowingComponent>(C->GetPathFollowingComponent()) : nullptr)
+		{
+			CF->SuspendCrowdSteering(!bOn);
+		}
+	}
 }
 
 // ============================================================ korutin
@@ -233,6 +245,15 @@ int32 ABozorNpcManager::ReserveSeat(ABozorNpc* Npc, const FVector& From, float M
 	return Best;
 }
 
+// ssenariy aniq o'rindiqni so'raydi: band bo'lsa - false
+bool ABozorNpcManager::ReserveSeatIndex(int32 Seat, ABozorNpc* Npc)
+{
+	if (!SeatOccupant.IsValidIndex(Seat) || (SeatOccupant[Seat].IsValid() && SeatOccupant[Seat].Get() != Npc)) return false;
+	SeatOccupant[Seat] = Npc;
+	SitCount++;
+	return true;
+}
+
 void ABozorNpcManager::ReleaseSeat(int32 Seat, ABozorNpc* Npc)
 {
 	if (SeatOccupant.IsValidIndex(Seat) && SeatOccupant[Seat].Get() == Npc) SeatOccupant[Seat] = nullptr;
@@ -358,6 +379,13 @@ void ABozorNpc::StartRole()
 	// tasodifiy faza: yaqin NPC'lar bir xil harakatni bir vaqtda qilmasin (yurish - AnimBP, harakatlar - Do)
 	Current = MoveState;
 	if (NpcRole != EBozorRole::Sotuvchi && NpcRole != EBozorRole::Suhbatdosh) Mgr->Movers.Add(this);
+	// qo'lda yozilgan ssenariy: yuradigan rollarda rol sikli o'rniga (sotuvchi, hamroh, suhbatdosh o'z sikllarida)
+	const bool bScripted = Script.Num() > 0 && (NpcRole == EBozorRole::Xaridor || NpcRole == EBozorRole::Yolovchi || NpcRole == EBozorRole::Hammol);
+	if (bScripted)
+	{
+		Main = ScriptLoop();
+		return;
+	}
 	switch (NpcRole)
 	{
 	case EBozorRole::Sotuvchi: Main = VendorLoop(); break;
@@ -426,9 +454,34 @@ void ABozorNpc::Play(FName State, float Fade, float Offset)
 
 // Kategoriyadan tasodifiy harakat; qaytaradi: davomiylik (sikl bo'lsa - [min, max] oralig'ida tasodifiy).
 // Loop bo'lmagan klip tugagach montaj o'zi AnimBP'ga (tik turishga) qaytadi; o'tirganda - o'tirish sikliga
+// NPC'ning o'z klipi (bir kategoriyada bir nechta bo'lsa - tasodifiy), bo'lmasa menejerning umumiy klipi
+const FBozorNpcAction* ABozorNpc::PickAction(FName Category) const
+{
+	int32 Count = 0;
+	for (const FBozorNpcAction& A : OwnActions) Count += A.Category == Category && A.Anim ? 1 : 0;
+	if (Count > 0)
+	{
+		int32 K = FMath::RandRange(0, Count - 1);
+		for (const FBozorNpcAction& A : OwnActions)
+		{
+			if (A.Category == Category && A.Anim && K-- == 0) return &A;
+		}
+	}
+	return Mgr ? Mgr->Pick(Category) : nullptr;
+}
+
+float ABozorNpc::DoFirst(const TArray<FName>& Categories, float Min, float Max)
+{
+	for (const FName& C : Categories)
+	{
+		if (PickAction(C)) return Do(C, Min, Max);
+	}
+	return Categories.Num() > 0 ? Do(Categories.Last(), Min, Max) : Min;
+}
+
 float ABozorNpc::Do(FName Category, float Min, float Max)
 {
-	const FBozorNpcAction* A = Mgr ? Mgr->Pick(Category) : nullptr;
+	const FBozorNpcAction* A = PickAction(Category);
 	UAnimInstance* Inst = GetMesh()->GetAnimInstance();
 	if (!A || !Inst)
 	{
@@ -577,20 +630,42 @@ FBozorCo ABozorNpc::CustomerLoop()
 	while (true)
 	{
 		const int32 Q = Mgr->BestQueue(GetActorLocation(), Last);
-		int32 Idx = Q != INDEX_NONE ? Mgr->Join(Q, this) : -1;
-		if (Idx < 0)
+		bool bReached = false;
+		if (Q != INDEX_NONE) co_await VisitStall(Q, FMath::FRandRange(4.f, 10.f), -1, &bReached);
+		if (!bReached)
 		{
 			co_await WalkTo(Mgr->RandomWanderPoint());
 			continue;
 		}
 		Last = Q;
+		if (FMath::FRand() < 0.2f) co_await WalkTo(Mgr->RandomWanderPoint());
+	}
+}
+
+// Bitta rasta: navbatga turadi (oldi bo'sh bo'lsa to'g'ri boradi), oldinga siljiydi, sabri tugasa ketadi;
+// yetib kelsa mol ko'radi (Browse s) va savdolashadi. ForceBuy: -1 tasodifiy (80% savdo x 75% xarid), 1 xarid, 0 savdolashib ketadi
+FBozorCo ABozorNpc::VisitStall(int32 Q, float Browse, int32 ForceBuy, bool* bOutReached)
+{
+	if (bOutReached) *bOutReached = false;
+	int32 Idx = Mgr->Queues.IsValidIndex(Q) ? Mgr->Join(Q, this) : -1;
+	// ssenariy xaridori: rasta oldida 2 tadan ko'p odam bo'lsa o'tib ketadi (odamlar gavjum rastani tashlab ketadi;
+	// tor yo'lakda navbat yo'lni to'sib, boshqalar 10 s gacha tiqilardi - 2026-11-09 kuzatuvi)
+	const bool bScripted = ForceBuy >= 0;
+	if (Idx < 0 || (bScripted && Idx >= 2))
+	{
+		if (Idx >= 0) Mgr->Leave(Q, this);
+		co_await FBozorWait{ 0.f };
+		co_return;
+	}
+	{
 		Queue = Q;                                      // hamrohlar navbat nuqtalariga turmasin (FollowerLoop)
 		const FBozorQueueSpot Spot = Mgr->Queues[Q];
 		StallForward = Spot.Forward;
 		// StartOnly: navbatga oxiridan kiradi
 		if (Spot.bStartOnly && Idx > 0) co_await WalkTo(Mgr->EntryPoint(Q));
 
-		float Patience = FMath::FRandRange(Spot.Patience.X, Spot.Patience.Y);
+		// ssenariyda sabr qisqa: bitta rastada 70-99 s turib qolmasin
+		float Patience = bScripted ? FMath::FRandRange(10.f, 20.f) : FMath::FRandRange(Spot.Patience.X, Spot.Patience.Y);
 		bool bGaveUp = false;
 		while (true)
 		{
@@ -616,15 +691,17 @@ FBozorCo ABozorNpc::CustomerLoop()
 		{
 			Mgr->Leave(Q, this);
 			Queue = INDEX_NONE;
-			continue;
+			co_return;
 		}
 
+		if (bOutReached) *bOutReached = true;
 		bAtStall = true;
 		ABozorNpc* Vendor = Spot.Vendor;
 		if (FMath::FRand() < 0.4f) Vendor->Greet();      // sotuvchi salomlashadi
-		co_await FBozorWait{ Do(TEXT("C_Browse"), 4.f, 10.f) };
+		// molni ko'radi: tanlab savatga soladi yoki shunchaki ko'zdan kechiradi
+		co_await FBozorWait{ DoFirst({ FMath::FRand() < 0.5f ? FName(TEXT("C_Pick")) : FName(TEXT("C_Browse")), TEXT("C_Browse") }, Browse, Browse) };
 
-		if (FMath::FRand() < 0.8f)
+		if (ForceBuy >= 0 || FMath::FRand() < 0.8f)
 		{
 			// sotuvchi boshqa joydagi xaridor bilan band bo'lsa, oldinda kutib turadi
 			float Wait = FMath::Max(Patience, 8.f);
@@ -634,35 +711,56 @@ FBozorCo ABozorNpc::CustomerLoop()
 				Wait -= 0.25f;
 				co_await FBozorWait{ 0.25f };
 			}
-			if (Vendor->Deal.Get() == this) co_await DealWith(Vendor);
+			if (Vendor->Deal.Get() == this) co_await DealWith(Vendor, ForceBuy);
 		}
 		bAtStall = false;
 		Mgr->Leave(Q, this);
 		Queue = INDEX_NONE;
-		if (FMath::FRand() < 0.2f) co_await WalkTo(Mgr->RandomWanderPoint());
 	}
 }
 
-// Savdo: navbatma-navbat gap (savdolashish) -> tortish -> pul -> rahmat; yoki "qimmat ekan" deb ketish
-FBozorCo ABozorNpc::DealWith(ABozorNpc* V)
+// Savdo (npc_ssenariy_rejasi.md 1.2): salom -> narx so'rash -> sotuvchi molni ko'rsatadi -> savdolashish (xaridor kam
+// taklif qiladi, sotuvchi bosh chayqaydi, xaridor o'ylanadi) -> ba'zan tatib ko'rishga beradi -> rozi bo'ladi -> tortish ->
+// paket va pul (o'ng qo'l) -> ikkalasi ham rahmat; yoki "qimmat ekan" deb ketish.
+// Yangi kategoriyalar (C_Greet, C_Ask, C_Haggle, C_Think, C_Taste, C_Thanks, V_Show, V_No, V_Yes, V_Offer) klipsiz bo'lsa eskisiga qaytadi
+FBozorCo ABozorNpc::DealWith(ABozorNpc* V, int32 ForceBuy)
 {
 	Mgr->TradesStarted++;
-	const int32 Turns = FMath::RandRange(3, 6);
-	float Total = 0.f;
-	const float Cap = FMath::FRandRange(15.f, 40.f);
-	for (int32 i = 0; i < Turns && Total < Cap; ++i)
+	const bool bBuy = ForceBuy >= 0 ? ForceBuy == 1 : FMath::FRand() < 0.75f;
+	// savdodan oldin salom-alik (o'zbek odobi)
+	const float G = DoFirst({ TEXT("C_Greet"), TEXT("C_Talk") }, 1.5f, 2.5f);
+	V->DoFirst({ TEXT("V_Greet"), TEXT("V_Listen") }, G, G);
+	co_await FBozorWait{ G };
+	// "Necha pul?" - sotuvchi molni ko'rsatib narxini aytadi
+	const float A = DoFirst({ TEXT("C_Ask"), TEXT("C_Talk") }, 1.5f, 3.f);
+	V->Do(TEXT("V_Listen"), A, A);
+	co_await FBozorWait{ A };
+	const float Sh = V->DoFirst({ TEXT("V_Show"), TEXT("V_Talk") }, 2.f, 3.5f);
+	ABozorSotuvchiOvozi::Say(V, TEXT("savdo"), 0.6f);
+	Do(TEXT("C_Listen"), Sh, Sh);
+	co_await FBozorWait{ Sh };
+	// savdolashish: xaridor tushirib so'raydi, sotuvchi oxirgi gapigacha "narxi shu" deb bosh chayqaydi
+	const int32 Turns = FMath::RandRange(2, 4);
+	for (int32 i = 0; i < Turns; ++i)
 	{
-		const float C = Do(TEXT("C_Talk"), 2.5f, 5.f);
+		const float C = DoFirst({ TEXT("C_Haggle"), TEXT("C_Talk") }, 2.5f, 5.f);
 		V->Do(TEXT("V_Listen"), C, C);
 		co_await FBozorWait{ C };
-		const float S = V->Do(TEXT("V_Talk"), 2.5f, 5.f);
-		ABozorSotuvchiOvozi::Say(V, TEXT("savdo"), 0.6f);       // narx aytadi, savdolashadi (har gapida emas)
-		Do(TEXT("C_Listen"), S, S);
+		const bool bLast = i + 1 == Turns;
+		const FName Answer = bLast && bBuy ? FName(TEXT("V_Yes")) : (FMath::FRand() < 0.5f ? FName(TEXT("V_No")) : FName(TEXT("V_Talk")));
+		const float S = V->DoFirst({ Answer, TEXT("V_Talk") }, 2.f, 4.f);
+		ABozorSotuvchiOvozi::Say(V, TEXT("savdo"), 0.6f);
+		DoFirst({ i % 2 == 1 ? FName(TEXT("C_Think")) : FName(TEXT("C_Listen")), TEXT("C_Listen") }, S, S);
 		co_await FBozorWait{ S };
-		Total += C + S;
+		// "Yeb ko'ring" - sotuvchi tatib ko'rishga uzatadi (bir marta)
+		if (i == 0 && FMath::FRand() < 0.35f)
+		{
+			const float T = V->DoFirst({ TEXT("V_Offer"), TEXT("V_Handout") }, 2.f, 3.f);
+			DoFirst({ TEXT("C_Taste"), TEXT("C_Listen") }, T, T);
+			co_await FBozorWait{ T };
+		}
 	}
-	// 80% savdolashadi x 75% sotib oladi = rastada to'xtaganlarning ~60% i xarid qiladi
-	if (FMath::FRand() < 0.75f)
+	if (bBuy)
 	{
 		// qo'l balandligida, tananing oldida (aktor joyi - kapsula markazi, oyoqdan ~88 sm)
 		const FVector VHand = V->GetActorLocation() + V->GetActorForwardVector() * 40.f + FVector(0.f, 0.f, 15.f);
@@ -680,10 +778,13 @@ FBozorCo ABozorNpc::DealWith(ABozorNpc* V)
 		Mgr->TradesBought++;
 		const float Th = V->Do(TEXT("V_Thanks"), 1.5f, 2.5f); // "Bozoringizni bersin!" - "Yana keling!"
 		ABozorSotuvchiOvozi::Say(V, TEXT("rahmat"));
-		co_await FBozorWait{ 1.2f };
-		V->EndDeal(Th - 1.2f);                                 // xaridor ketadi, sotuvchi ta'zimni oxirigacha qiladi
+		const float CTh = DoFirst({ TEXT("C_Thanks"), TEXT("C_Listen") }, 1.2f, 2.f);   // xaridor ham qo'lini ko'ksiga qo'yadi
+		co_await FBozorWait{ FMath::Min(CTh, 1.6f) };
+		V->EndDeal(FMath::Max(Th - 1.6f, 0.f));               // xaridor ketadi, sotuvchi ta'zimni oxirigacha qiladi
 		co_return;
 	}
+	// "Qimmat ekan" - sotuvchi o'z narxida qoladi, xaridor indamay ketadi (keyin qaytishi mumkin)
+	V->DoFirst({ TEXT("V_No"), TEXT("V_Listen") }, 1.5f, 2.5f);
 	co_await FBozorWait{ Do(TEXT("C_Reject"), 1.5f, 3.f) };
 	V->EndDeal();
 }
@@ -713,25 +814,52 @@ FBozorCo ABozorNpc::FollowerLoop()
 	co_await FBozorWait{ 0.f };
 	const float Side = GroupSlot % 2 == 1 ? 1.f : -1.f;
 	const float Row = static_cast<float>((GroupSlot - 1) / 2);
-	double IdleUntil = 0.0, StuckUntil = 0.0;
-	float BestTo = MAX_flt, NoProgress = 0.f;
-	FVector LastSlot = GetActorLocation();
+	double IdleUntil = 0.0, StuckUntil = 0.0, DetourUntil = 0.0, YieldCheck = 0.0, CrowdOff = 0.0;
+	float BestTo = MAX_flt, NoProgress = 0.f, WalkStuck = 0.f, TouchT = 0.f;
+	bool bWalking = false;
+	FVector LastSlot = GetActorLocation(), Detour = FVector::ZeroVector, LastGoal(1e9);
 	FVector Spot = FVector::ZeroVector, SpotFor(1e9);   // kutish joyi va u tanlangan paytdagi boshliq joyi
 	while (Leader)
 	{
 		const double Now = GetWorld()->GetTimeSeconds();
-		const FVector Lv = Flat(Leader->GetVelocity());
-		const bool bWalking = Lv.SizeSquared() > 20.f * 20.f;
-		FVector Slot;
-		if (bWalking || Leader->Queue == INDEX_NONE)
+		if (CrowdOff > 0.0 && Now >= CrowdOff)
 		{
-			Slot = Leader->GetActorLocation() + Leader->GetActorRightVector() * Side * 60.f - Leader->GetActorForwardVector() * (15.f + Row * 60.f);
+			SetCrowdSteering(AI(), true);
+			CrowdOff = 0.0;
+		}
+		const FVector Lv = Flat(Leader->GetVelocity());
+		// gisterezis: boshliq tiqilib 10-30 sm/s da tebransa, hamroh yurish va kutish orasida almashib turmasin.
+		// Boshliq yo'lga chiqdi (hali tezlanmagan bo'lsa ham) - hamroh ham yuradi: aks holda boshliq yo'lida turgan
+		// hamroh uni to'sib qo'yardi, boshliq esa tezlana olmasdi (2026-11-09: 8-20 s qotish)
+		const AAIController* LeaderAI = Leader->AI();
+		const bool bLeaderGoing = LeaderAI && LeaderAI->GetMoveStatus() == EPathFollowingStatus::Moving;
+		bWalking = bLeaderGoing || (bWalking ? Lv.Size() > 15.f : Lv.Size() > 35.f);
+		const float Step = bWalking ? 0.1f : 0.25f;
+		FVector Slot;
+		if (bWalking)
+		{
+			const FVector Lp = Leader->GetActorLocation();
+			Slot = Lp + Leader->GetActorRightVector() * Side * 60.f - Leader->GetActorForwardVector() * (15.f + Row * 60.f);
+			// boshliq endi yo'lga chiqyapti (hali sekin, tanasi yo'lga burilmagan): yondagi joy uning yo'li ustida bo'lishi
+			// mumkin - ikkalasi bir-birini itarib qotardi (2026-11-09: 10 s). Hamroh yo'lda tursa chetga chiqadi, aks holda orqasiga o'tadi
+			const FVector Pd = Lv.Size() < 35.f ? Leader->PathDir(Lp) : FVector::ZeroVector;
+			if (!Pd.IsNearlyZero())
+			{
+				const FVector Pr = FVector::CrossProduct(FVector::UpVector, Pd);
+				const FVector Rel = Flat(GetActorLocation() - Lp);
+				const float Away = FVector::DotProduct(Rel, Pr) >= 0.f ? 1.f : -1.f;
+				Slot = Rel.Size() < 130.f && FVector::DotProduct(Rel.GetSafeNormal(), Pd) > 0.3f
+					? Lp + Pr * Away * 110.f
+					: Lp - Pd * (70.f + Row * 60.f) + Pr * Away * 45.f;
+			}
 			FVector H;
 			if (ProjectToNav(Slot, H, 80.f)) Slot = H;
+			SpotFor = FVector(1e9);
 		}
 		else
 		{
-			// kutish joyi boshliq to'xtaganda bir marta tanlanadi: har tikda qayta hisoblansa, hamroh tebranib yurardi
+			// kutish joyi boshliq to'xtaganda bir marta tanlanadi (navbatda bo'lmasa ham): har tikda boshliq burilishidan
+			// qayta hisoblansa, joy boshliq atrofida aylanib, hamroh uning ortidan aylanardi (2026-11-09 kuzatuvi)
 			if (FVector::DistSquared2D(Leader->GetActorLocation(), SpotFor) > 30.f * 30.f)
 			{
 				Spot = WaitSpot(Side, Row);
@@ -739,7 +867,8 @@ FBozorCo ABozorNpc::FollowerLoop()
 			}
 			Slot = Spot;
 		}
-		const float To = FVector::Dist2D(Slot, GetActorLocation());
+		const FVector Here = GetActorLocation();
+		const float To = FVector::Dist2D(Slot, Here);
 		// joyiga yetib bo'lmayapti: turgan joyida kutadi (boshliq yonida 2.5 m, lekin 1.5 s yaqinlasha olmadi)
 		if (bWalking || FVector::DistSquared2D(Slot, LastSlot) > 50.f * 50.f)
 		{
@@ -755,51 +884,169 @@ FBozorCo ABozorNpc::FollowerLoop()
 		}
 		else
 		{
-			NoProgress += bWalking ? 0.1f : 0.25f;
+			NoProgress += Step;
 		}
-		if (!bWalking && To < 250.f && NoProgress > 1.5f) StuckUntil = DBL_MAX;
+		// boshliqqa tiralib turibdi: uning atrofida aylanib yurmaydi, tezroq turgan joyida qoladi
+		const bool bTouching = FVector::Dist2D(Here, Leader->GetActorLocation()) < 85.f;
+		// tegib turgan holda sekin yaqinlashsa ham (boshliq atrofida aylanib) - 1 s dan keyin to'xtaydi
+		TouchT = !bWalking && bTouching ? TouchT + Step : 0.f;
+		if (!bWalking && To < 250.f && (NoProgress > (bTouching ? 0.5f : 1.5f) || TouchT > 1.f)) StuckUntil = DBL_MAX;
 		const bool bUnreachable = !bWalking && Now < StuckUntil;
+		FVector Goal = Slot;
+		float Speed = 0.f;
 		if (bWalking)
 		{
 			// yo'lni boshliq ketayotgan tomonga oldindan olamiz; tezlikni esa hozirgi joydan orqada qolishga qarab
-			const float Lag = FVector::DotProduct(Slot - GetActorLocation(), Lv.GetSafeNormal());
+			const float Lag = FVector::DotProduct(Slot - Here, Lv.GetSafeNormal());
 			const float Lo = FMath::Max(Lv.Size() * 0.6f, MinWalk);
-			StartWalking(Slot + Lv * 0.4f, SafeClamp(Lv.Size() + 0.9f * Lag, Lo, FMath::Max(MinWalk, FMath::Min(Leader->WalkSpeed * 1.5f, MaxWalk))));
-			IdleUntil = 0.0;
+			Goal = Slot + Lv * 0.4f;
+			Speed = SafeClamp(Lv.Size() + 0.9f * Lag, Lo, FMath::Max(MinWalk, FMath::Min(Leader->WalkSpeed * 1.5f, MaxWalk)));
 		}
 		else if (To > 30.f && !bUnreachable)
 		{
-			StartWalking(Slot, SafeClamp(50.f + 0.6f * To, MinWalk, FMath::Max(MinWalk, FMath::Min(Leader->WalkSpeed * 1.3f, MaxWalk))));
+			Speed = SafeClamp(50.f + 0.6f * To, MinWalk, FMath::Max(MinWalk, FMath::Min(Leader->WalkSpeed * 1.3f, MaxWalk)));
+		}
+		if (Speed > 0.f)
+		{
+			// tik turgan odamlarga tiraldi (boshliq ketib qolardi, 2026-11-09: 9 s, 8 m): yonidan aylanib o'tadi;
+			// oldida hech kim bo'lmasa - joy yetib bo'lmaydigan joyda, boshliqning o'ziga yo'l so'raydi
+			WalkStuck = IsMoving() ? 0.f : WalkStuck + Step;
+			if (Now < DetourUntil && FVector::DistSquared2D(Here, Detour) > 30.f * 30.f)
+			{
+				// aylanib o'tish nuqtasiga ketyapti
+			}
+			else if (WalkStuck > 0.8f)
+			{
+				WalkStuck = 0.f;
+				LastGoal = FVector(1e9);   // aylanib o'tgach asosiy manzil qayta so'raladi
+				const FVector Dir = PathDir(Goal);
+				const ABozorNpc* B = BlockerAhead(Dir, 110.f);
+				const bool bFar = FVector::DistSquared2D(Here, Leader->GetActorLocation()) > 600.f * 600.f;
+				if (B && B != Leader.Get() && DetourPoint(B, Dir, Detour))
+				{
+					StartWalking(Detour, Speed);
+					DetourUntil = Now + 1.5;
+				}
+				else if ((!B || bFar) && bWalking)
+				{
+					// boshliqdan uzoqlashib qoldi (6 m+) yoki oldida hech kim yo'q: to'g'ri boshlig'ining yoniga yo'l so'raydi
+					Detour = Leader->GetActorLocation();
+					if (bFar && CrowdOff <= 0.0)
+					{
+						SetCrowdSteering(AI(), false);
+						CrowdOff = Now + 1.5;
+					}
+					StartWalking(Detour, Speed);
+					DetourUntil = Now + 1.0;
+				}
+				else
+				{
+					// aylanib o'tib bo'lmadi (tor yo'lakda navbat, o'z guruhdoshi) yoki oldida hech kim yo'q - NavMesh chetida
+					// crowd tutib qolgan bo'lishi mumkin: crowd steering vaqtincha o'chadi (2026-11-09: hamroh 150 s qotgan)
+					if (B != Leader.Get() && CrowdOff <= 0.0)
+					{
+						SetCrowdSteering(AI(), false);
+						CrowdOff = Now + 1.5;
+					}
+					StartWalking(Goal, Speed);
+				}
+			}
+			else
+			{
+				DetourUntil = 0.0;
+				// yo'l har 0.1 s da emas, faqat manzil 30 sm dan ko'p surilganda yoki yo'l tugaganda qayta so'raladi
+				// (har so'rov crowd yo'lini qaytadan boshlaydi); tezlik esa har tikda yangilanadi
+				const AAIController* MyAI = AI();
+				if (FVector::DistSquared2D(Goal, LastGoal) > 30.f * 30.f || !MyAI || MyAI->GetMoveStatus() != EPathFollowingStatus::Moving)
+				{
+					StartWalking(Goal, Speed);
+					LastGoal = Goal;
+				}
+				else
+				{
+					GetCharacterMovement()->MaxWalkSpeed = Speed;
+				}
+			}
 			IdleUntil = 0.0;
 		}
 		else
 		{
-			if (IsMoving()) StopMoving();
+			WalkStuck = 0.f;
+			DetourUntil = 0.0;
+			LastGoal = FVector(1e9);
+			// tezlikka emas, AI holatiga qaraladi: tiralgan hamroh tezligi 0, lekin yo'l so'rovi faol qolib, boshliqni itarardi
+			const AAIController* MyAI = AI();
+			if (MyAI && MyAI->GetMoveStatus() != EPathFollowingStatus::Idle) StopMoving();
+			// begona yo'lovchi unga tiralib o'tolmayapti (tor yo'lakda guruh orasida qisilib 12 s turgan, 2026-11-09):
+			// hamroh uning yo'lidan bir qadam chetga chiqadi va o'sha yerda kutadi
+			if (Now >= YieldCheck)
+			{
+				YieldCheck = Now + 0.5;
+				for (const TWeakObjectPtr<ABozorNpc>& M : Mgr->Movers)
+				{
+					const ABozorNpc* N = M.Get();
+					if (!N || N == this || N == Leader.Get() || N->Leader.Get() == Leader.Get() || N->IsMoving()) continue;
+					const FVector Rel = Flat(Here - N->GetActorLocation());
+					if (Rel.SizeSquared() > 95.f * 95.f) continue;
+					const AAIController* NA = N->AI();
+					if (!NA || NA->GetMoveStatus() != EPathFollowingStatus::Moving) continue;
+					const FVector Nd = N->PathDir(N->GetActorLocation());
+					if (Nd.IsNearlyZero() || FVector::DotProduct(Rel.GetSafeNormal(), Nd) < 0.4f) continue;
+					const FVector Pr = FVector::CrossProduct(FVector::UpVector, Nd);
+					FVector H;
+					if (ProjectToNav(Here + Pr * (FVector::DotProduct(Rel, Pr) >= 0.f ? 1.f : -1.f) * 70.f, H, 30.f))
+					{
+						Spot = H;
+						LastSlot = H;
+						StuckUntil = 0.0;
+						BestTo = MAX_flt;
+						NoProgress = 0.f;
+						TouchT = 0.f;
+					}
+					break;
+				}
+			}
 			if (Now >= IdleUntil)
 			{
 				TurnTowards(Leader->Queue != INDEX_NONE && FMath::FRand() < 0.6f ? Leader->StallForward : Leader->GetActorLocation() - GetActorLocation());
 				IdleUntil = Now + Do(TEXT("F_Idle"), 4.f, 9.f);
 			}
 		}
-		co_await FBozorWait{ bWalking ? 0.1f : 0.25f };
+		co_await FBozorWait{ Step };
 	}
 }
 
-// Boshliq navbatda / rasta oldida: navbat nuqtalaridan uzoqroq joy
+// Boshliq to'xtadi (navbatda / rasta oldida yoki shunchaki): navbat nuqtalaridan uzoqroq, hamrohga eng yaqin joy.
+// Hozir turgan joyi yaroqli bo'lsa - qimirlamaydi (boshliqning narigi tomoniga uni aylanib o'tmaydi)
 FVector ABozorNpc::WaitSpot(float Side, float Row) const
 {
-	const FVector F = Flat(Leader->StallForward).GetSafeNormal();
+	const bool bStall = Leader->Queue != INDEX_NONE;
+	const FVector F = Flat(bStall ? Leader->StallForward : Leader->GetActorForwardVector()).GetSafeNormal();
 	const FVector R = FVector::CrossProduct(FVector::UpVector, F);
-	const FVector Lp = Leader->GetActorLocation();
+	const FVector Lp = Leader->GetActorLocation(), Here = GetActorLocation();
+	const FVector Rel = Flat(Here - Lp);
+	const float D = Rel.Size();
+	// rastada: boshliq bilan peshtaxta orasida (oldida) turmaydi
+	if (D > 60.f && D < 170.f + Row * 55.f && FVector::DotProduct(Rel / D, F) < (bStall ? 0.2f : 0.9f) && !Mgr->NearAnyPoint(Here, 60.f))
+	{
+		return Here;
+	}
 	const float Back = 85.f + Row * 55.f, Wide = 85.f * (1.f + Row);
 	const FVector Offsets[] = { -F * Back + R * Side * 35.f, -F * Back - R * Side * 35.f, R * Side * Wide - F * 30.f, -R * Side * Wide - F * 30.f };
+	FVector Best = Lp + Offsets[0];
+	float Bd = MAX_flt;
 	for (const FVector& O : Offsets)
 	{
 		FVector H;
 		if (!ProjectToNav(Lp + O, H, 30.f) || Mgr->NearAnyPoint(H, 60.f)) continue;
-		return H;
+		const float Dh = FVector::DistSquared2D(H, Here);
+		if (Dh < Bd)
+		{
+			Bd = Dh;
+			Best = H;
+		}
 	}
-	return Lp + Offsets[0];
+	return Best;
 }
 
 // ================= yo'lovchi va hammol
@@ -820,11 +1067,13 @@ FBozorCo ABozorNpc::WalkerLoop()
 // Keyingi manzil: kamida 3 m narida. Hammolga - iloji bo'lsa oldinda (arava ortga yurmasin)
 FVector ABozorNpc::NextWalkTarget() const
 {
+	const bool bAvoid = GetWorld()->GetTimeSeconds() < AvoidUntil;
 	for (int32 i = 0; i < 8; ++i)
 	{
 		const FVector P = FMath::FRand() < 0.3f ? Mgr->RandomGatePoint() : Mgr->RandomWanderPoint();
 		const FVector To = Flat(P - GetActorLocation());
 		if (To.SizeSquared() < 300.f * 300.f) continue;
+		if (bAvoid && i < 6 && FVector::DotProduct(To.GetSafeNormal(), AvoidDir) > 0.6f) continue;
 		if (Cart && i < 6 && FVector::DotProduct(To.GetSafeNormal(), GetActorForwardVector()) < -0.2f) continue;
 		return P;
 	}
@@ -836,6 +1085,17 @@ FBozorCo ABozorNpc::SitDown()
 {
 	const int32 Seat = Mgr->ReserveSeat(this, GetActorLocation(), 3000.f);
 	if (Seat == INDEX_NONE) co_return;
+	co_await SitAt(Seat, FMath::FRandRange(15.f, 40.f));
+}
+
+// Aniq o'rindiqqa o'tirish (ssenariy): band bo'lsa o'tirmaydi; choyxonada choy ichadi yoki shunchaki o'tiradi
+FBozorCo ABozorNpc::SitAt(int32 Seat, float Time)
+{
+	if (!Mgr->ReserveSeatIndex(Seat, this))
+	{
+		co_await FBozorWait{ 0.f };
+		co_return;
+	}
 	const FBozorSeat S = Mgr->Seats[Seat];
 	const FVector Front = S.Position + S.Forward * 45.f;
 	co_await WalkTo(Front);
@@ -858,7 +1118,7 @@ FBozorCo ABozorNpc::SitDown()
 	FVector Back = Front;
 	Back.Z = Here.Z;
 	co_await Slide(Here, On, Do(TEXT("S_Down"), 1.2f, 2.5f));
-	float T = FMath::FRandRange(15.f, 40.f);
+	float T = Time;
 	while (T > 0.f)
 	{
 		const float D = Do(FMath::FRand() < 0.6f ? TEXT("S_Loop") : TEXT("S_Drink"), 5.f, 10.f);
@@ -1175,18 +1435,98 @@ FBozorCo ABozorNpc::TalkerLoop()
 
 // ================= yordamchilar
 
-FBozorCo ABozorNpc::WalkTo(FVector Target)
+// ================= qo'lda yozilgan ssenariy
+// Behavior Tree'dagi Sequence kabi: qadamlar ketma-ket, har biri tugaguncha (Running) davom etadi; oxirida boshiga
+// qaytadi. Qaror (qayerga, nima) ssenariyda, harakat - NavMesh + crowd (game-ai: decide / move ajratilgan)
+FBozorCo ABozorNpc::ScriptLoop()
+{
+	co_await FBozorWait{ StartDelay };
+	while (Script.Num() > 0)
+	{
+		for (int32 i = 0; i < Script.Num(); ++i)
+		{
+			ScriptStep = i;
+			const FBozorStep S = Script[i];
+			// guruh boshlig'i: hamrohlari orqada qolgan bo'lsa (4.5 m+) ularga qarab kutadi, ko'pi bilan 8 s
+			// (oila bir-birini kutadi; aks holda hamroh 14 m orqada qolib, gavjumda tiqilardi - 2026-11-09)
+			for (float W = 8.f; W > 0.f; W -= 0.25f)
+			{
+				const ABozorNpc* Lag = nullptr;
+				for (const TWeakObjectPtr<ABozorNpc>& M : Mgr->Movers)
+				{
+					if (M.IsValid() && M->Leader.Get() == this && FVector::DistSquared2D(M->GetActorLocation(), GetActorLocation()) > 450.f * 450.f) Lag = M.Get();
+				}
+				if (!Lag) break;
+				if (W == 8.f)
+				{
+					StopMoving();
+					TurnTowards(Lag->GetActorLocation() - GetActorLocation());
+					DoFirst({ TEXT("C_Wait"), TEXT("P_Pause") }, 3.f, 3.f);
+				}
+				co_await FBozorWait{ 0.25f };
+			}
+			switch (S.Op)
+			{
+			case EBozorStepOp::GoTo:
+				co_await WalkTo(S.Target, S.Speed);
+				break;
+			case EBozorStepOp::Anim:
+			{
+				const float T = Do(S.Clip, FMath::Max(S.Time, 0.5f), FMath::Max(S.Time, 0.5f));
+				co_await FBozorWait{ S.Time > 0.f ? S.Time : T };
+				break;
+			}
+			case EBozorStepOp::Face:
+				co_await TurnTo((S.Other ? S.Other->GetActorLocation() : S.Target) - GetActorLocation());
+				break;
+			case EBozorStepOp::Greet:
+				// tanish sotuvchi bilan salom-alik: unga buriladi, qo'lini ko'ksiga qo'yadi, sotuvchi javob beradi
+				if (S.Other)
+				{
+					co_await TurnTo(S.Other->GetActorLocation() - GetActorLocation());
+					S.Other->Greet();
+					co_await FBozorWait{ DoFirst({ S.Clip.IsNone() ? FName(TEXT("C_Greet")) : S.Clip, TEXT("C_Greet"), TEXT("C_Talk") }, 1.5f, 2.5f) };
+				}
+				break;
+			case EBozorStepOp::Stall:
+			{
+				bool bReached = false;
+				co_await VisitStall(S.Index, S.Time > 0.f ? S.Time : 6.f, S.bBuy ? 1 : 0, &bReached);
+				break;
+			}
+			case EBozorStepOp::Sit:
+				co_await SitAt(S.Index, S.Time > 0.f ? S.Time : 25.f);
+				break;
+			case EBozorStepOp::Wait:
+			default:
+				if (!S.Clip.IsNone()) Do(S.Clip, S.Time, S.Time);
+				else PlayMove();
+				co_await FBozorWait{ FMath::Max(S.Time, 0.f) };
+				break;
+			}
+		}
+		// har aylanishda kamida bir kadr: hamma qadami bir zumda tugaydigan ssenariy o'yinni qotirmasin
+		co_await FBozorWait{ 0.f };
+	}
+}
+
+FBozorCo ABozorNpc::WalkTo(FVector Target, float Speed)
 {
 	AAIController* C = AI();
 	bTurning = false;
 	PlayMove();
+	// ssenariy qadami o'z tezligini berishi mumkin (shoshgan yo'lovchi, sekin keksa)
+	const float WalkSpd = Speed > 0.f ? FMath::Clamp(Speed, MinWalk, MaxWalk) : WalkSpeed;
 	// yurib bo'lmaydi: chaqiruvchi sikl kadr kutmasdan aylanib qolmasin
-	if (!C || !MoveRequest(Target, WalkSpeed))
+	if (!C || !MoveRequest(Target, WalkSpd))
 	{
 		co_await FBozorWait{ 0.f };
 		co_return;
 	}
-	float Timeout = 90.f, Still = 0.f;
+	float Timeout = 90.f, Still = 0.f, Slow = 0.f;
+	int32 Detours = 0;
+	bool bGaveUp = false;
+	double CrowdOff = 0.0;
 	float Best = FVector::Dist2D(Target, GetActorLocation());
 	bCartTurnFailed = false;
 	while (Timeout > 0.f && C->GetMoveStatus() != EPathFollowingStatus::Idle)
@@ -1194,15 +1534,63 @@ FBozorCo ABozorNpc::WalkTo(FVector Target)
 		co_await FBozorWait{ 0.f };
 		const float Dt = GetWorld()->GetDeltaSeconds();
 		Timeout -= Dt;
+		if (CrowdOff > 0.0 && GetWorld()->GetTimeSeconds() >= CrowdOff)
+		{
+			SetCrowdSteering(C, true);
+			CrowdOff = 0.0;
+		}
 		// aravani orqaga burib bo'lmadi - boshqa manzil
 		if (bCartTurnFailed)
 		{
 			bCartTurnFailed = false;
 			break;
 		}
-		// 3 s manzilga yaqinlashmadi (yo'lni odamlar to'sib turibdi): bu manzildan voz kechadi. Arava burilyapti - bu tiqilish emas
 		const float Dist = FVector::Dist2D(Target, GetActorLocation());
 		if (Dist <= 50.f) CartTurnFails = 0;      // manzilga yetdi: keyingi safar yana burib ko'radi
+		// tik turgan odamga tiralib qoldi (crowd uni aylanib o'tolmay tezlik 0 bo'ladi, 2026-11-09 kuzatuvi: 3-10 s):
+		// manzilning o'zida odam tursa - yetib keldi deb hisoblaydi, aks holda uning yonidan aylanib o'tadi
+		Slow = IsMoving() || bCartTurning ? 0.f : Slow + Dt;
+		if (Slow > 0.6f)
+		{
+			Slow = 0.f;
+			const FVector Dir = PathDir(Target);
+			if (ABozorNpc* B = BlockerAhead(Dir, 110.f))
+			{
+				// manzilga 1.2 m qoldi, oldida begona odam: yetib keldi deb hisoblaydi (o'z hamrohi esa yo'l beradi)
+				if (Dist < 120.f && B->Leader.Get() != this) break;
+				FVector Det;
+				if (Detours < 2 && DetourPoint(B, Dir, Det))
+				{
+					Detours++;
+					MoveRequest(Det, WalkSpd);
+					// aylanib o'tish vaqti ham tiqilish hisobiga kiradi: o'tib bo'lmasa, 3 s da voz kechadi
+					for (float T = 2.f; T > 0.f && C->GetMoveStatus() != EPathFollowingStatus::Idle && FVector::DistSquared2D(GetActorLocation(), Det) > 30.f * 30.f; T -= GetWorld()->GetDeltaSeconds())
+					{
+						co_await FBozorWait{ 0.f };
+						Still += GetWorld()->GetDeltaSeconds();
+					}
+					if (!MoveRequest(Target, WalkSpd))
+					{
+						bGaveUp = true;
+						break;
+					}
+					continue;
+				}
+				// aylanib o'tadigan bo'sh joy yo'q (tor yo'lakdagi navbat): crowd'siz yo'l bo'yicha sirpanib o'tishga urinadi
+				if (CrowdOff <= 0.0)
+				{
+					SetCrowdSteering(C, false);
+					CrowdOff = GetWorld()->GetTimeSeconds() + 1.5;
+				}
+			}
+			else if (CrowdOff <= 0.0)
+			{
+				// oldida odam yo'q, lekin yurolmayapti: NavMesh chetida crowd tutib qolgan
+				SetCrowdSteering(C, false);
+				CrowdOff = GetWorld()->GetTimeSeconds() + 1.5;
+			}
+		}
+		// 3 s manzilga yaqinlashmadi (yo'lni odamlar to'sib turibdi): bu manzildan voz kechadi. Arava burilyapti - bu tiqilish emas
 		if (Dist < Best - 30.f || bCartTurning)
 		{
 			Best = FMath::Min(Best, Dist);
@@ -1210,10 +1598,78 @@ FBozorCo ABozorNpc::WalkTo(FVector Target)
 		}
 		else if ((Still += Dt) > 3.f)
 		{
+			bGaveUp = true;
 			break;
 		}
 	}
+	// voz kechildi: keyingi manzil 10 s shu tomonda tanlanmaydi (aks holda yana o'sha odamga tiraladi)
+	if (bGaveUp)
+	{
+		AvoidDir = Flat(Target - GetActorLocation()).GetSafeNormal();
+		AvoidUntil = GetWorld()->GetTimeSeconds() + 10.0;
+	}
+	if (CrowdOff > 0.0) SetCrowdSteering(C, true);
 	StopMoving();
+}
+
+// yo'lning hozirgi yo'nalishi (keyingi burilish nuqtasiga), yo'l bo'lmasa - to'g'ri manzilga
+FVector ABozorNpc::PathDir(const FVector& Goal) const
+{
+	const FVector Here = GetActorLocation();
+	FVector To = Goal;
+	if (AAIController* C = AI())
+	{
+		const UPathFollowingComponent* PF = C->GetPathFollowingComponent();
+		if (PF && PF->GetStatus() != EPathFollowingStatus::Idle) To = SteeringTarget(PF, Here);
+	}
+	FVector D = Flat(To - Here);
+	if (D.SizeSquared() < 1.f) D = Flat(Goal - Here);
+	return D.GetSafeNormal();
+}
+
+// Dir tomonida Radius ichidagi eng yaqin odam (o'tirganlar - to'qnashuvi o'chiq - hisobga olinmaydi)
+ABozorNpc* ABozorNpc::BlockerAhead(const FVector& Dir, float Radius) const
+{
+	ABozorNpc* Best = nullptr;
+	float Bd = Radius * Radius;
+	for (TActorIterator<ABozorNpc> It(GetWorld()); It; ++It)
+	{
+		if (*It == this || !It->GetActorEnableCollision()) continue;
+		const FVector D = Flat(It->GetActorLocation() - GetActorLocation());
+		const float S = D.SizeSquared();
+		if (S < Bd && FVector::DotProduct(D.GetSafeNormal(), Dir) > 0.2f)
+		{
+			Bd = S;
+			Best = *It;
+		}
+	}
+	return Best;
+}
+
+// To'siq odamning yonidan (o'zimiz turgan tomondan, bo'lmasa narigi tomondan) o'tib ketadigan bo'sh nuqta
+bool ABozorNpc::DetourPoint(const ABozorNpc* Blocker, const FVector& Dir, FVector& Out) const
+{
+	const FVector Bp = Blocker->GetActorLocation();
+	const FVector R = FVector::CrossProduct(FVector::UpVector, Dir);
+	const float Pref = FVector::DotProduct(Flat(GetActorLocation() - Bp), R) >= 0.f ? 1.f : -1.f;
+	// tor joyda (rasta yonida) 95 sm yon tomonda NavMesh bo'lmasligi mumkin - yaqinrog'i ham sinaladi
+	for (const float Wide : { 95.f, 72.f })
+	{
+		for (const float S : { Pref, -Pref })
+		{
+			FVector H;
+			if (!ProjectToNav(Bp + R * S * Wide + Dir * 40.f, H, 30.f)) continue;
+			bool bFree = true;
+			for (TActorIterator<ABozorNpc> It(GetWorld()); It && bFree; ++It)
+			{
+				if (*It != this && FVector::DistSquared2D(It->GetActorLocation(), H) < 45.f * 45.f) bFree = false;
+			}
+			if (!bFree) continue;
+			Out = H;
+			return true;
+		}
+	}
+	return false;
 }
 
 FBozorCo ABozorNpc::TurnTo(FVector Forward)

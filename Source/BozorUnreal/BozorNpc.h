@@ -137,6 +137,50 @@ struct FBozorQueueSpot
 	FVector2D Patience = FVector2D(20.f, 45.f);
 };
 
+// Qo'lda yozilgan ssenariy qadami (npc_ssenariy_rejasi.md, 3-bo'lim). Ssenariy - Behavior Tree'dagi Sequence kabi:
+// qadamlar ketma-ket, har biri tugaguncha davom etadi; oxirida boshiga qaytadi
+UENUM(BlueprintType)
+enum class EBozorStepOp : uint8
+{
+	GoTo,    // Target nuqtaga boradi (Speed > 0 bo'lsa shu tezlikda)
+	Anim,    // Clip kategoriyasini Time soniya o'ynaydi
+	Face,    // Other'ga yoki Target nuqtaga buriladi
+	Greet,   // Other (sotuvchi) bilan salomlashadi
+	Stall,   // Index-navbatdagi rastaga boradi: navbat, mol ko'rish (Time), bBuy - xarid yoki "qimmat" deb ketish
+	Sit,     // Index-o'rindiqqa Time soniya o'tiradi
+	Wait     // Time soniya kutadi (tik turish)
+};
+
+USTRUCT(BlueprintType)
+struct FBozorStep
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bozor")
+	EBozorStepOp Op = EBozorStepOp::Wait;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bozor")
+	FVector Target = FVector::ZeroVector;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bozor")
+	TObjectPtr<ABozorNpc> Other = nullptr;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bozor")
+	FName Clip;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bozor")
+	float Time = 0.f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bozor")
+	float Speed = 0.f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bozor")
+	int32 Index = -1;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bozor")
+	bool bBuy = true;
+};
+
 USTRUCT(BlueprintType)
 struct FBozorSeat
 {
@@ -201,6 +245,7 @@ public:
 
 	// o'rindiqlar (Unity BozorCrowdAI)
 	int32 ReserveSeat(ABozorNpc* Npc, const FVector& From, float MaxDistance);
+	bool ReserveSeatIndex(int32 Seat, ABozorNpc* Npc);
 	void ReleaseSeat(int32 Seat, ABozorNpc* Npc);
 
 	// yuradigan NPC'lar (sotuvchi chaqirig'i uchun)
@@ -290,6 +335,27 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bozor")
 	bool bCart = false;
 
+	// Qo'lda yozilgan ssenariy (Scripts/npc_ssenariy.json -> npc_ssenariy.py). Bo'sh bo'lmasa rol sikli o'rniga shu bajariladi
+	// (sotuvchi, hamroh va suhbatdosh o'z sikllarida qoladi, ular faqat o'z animatsiyalarini oladi)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bozor")
+	TArray<FBozorStep> Script;
+
+	// ssenariy boshlanishidan oldingi kutish (NPC'lar bir vaqtda bir joyga yopirilmasin)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bozor")
+	float StartDelay = 0.f;
+
+	// NPC'ning o'z animatsiyalari (kategoriya -> klip). Do() avval shundan, topilmasa menejerdan oladi
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bozor")
+	TArray<FBozorNpcAction> OwnActions;
+
+	// kim ekani (keksa ota, ona, talaba ...) - faqat ma'lumot uchun
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bozor")
+	FString Persona;
+
+	// hozir bajarilayotgan qadam (kuzatuv/tashxis uchun)
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Bozor")
+	int32 ScriptStep = -1;
+
 	virtual void OnConstruction(const FTransform& Transform) override;
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type Reason) override;
@@ -369,18 +435,32 @@ private:
 	void AttachCart();
 	FVector NextWalkTarget() const;
 	FVector WaitSpot(float Side, float Row) const;
+	// tik turgan odamlar: yo'l ularni bilmaydi, shuning uchun tiralib qolganda yonidan aylanib o'tiladi
+	FVector PathDir(const FVector& Goal) const;
+	ABozorNpc* BlockerAhead(const FVector& Dir, float Radius) const;
+	bool DetourPoint(const ABozorNpc* Blocker, const FVector& Dir, FVector& Out) const;
+	// WalkTo voz kechgan yo'nalish: keyingi manzil bir muddat shu tomonda tanlanmaydi
+	FVector AvoidDir = FVector::ZeroVector;
+	double AvoidUntil = 0.0;
 	bool ProjectToNav(const FVector& P, FVector& Out, float Extent) const;
 	class AAIController* AI() const;
 
 	FBozorCo VendorLoop();
 	FBozorCo WaitOrDeal(float T);
 	FBozorCo CustomerLoop();
-	FBozorCo DealWith(ABozorNpc* V);
+	FBozorCo DealWith(ABozorNpc* V, int32 ForceBuy = -1);
+	FBozorCo ScriptLoop();
+	// navbat orqali rastaga borish va savdo (CustomerLoop'ning bitta aylanishi). Natija: true - rastaga yetdi
+	FBozorCo VisitStall(int32 Q, float Browse, int32 ForceBuy, bool* bOutReached);
+	FBozorCo SitAt(int32 Seat, float Time);
+	const FBozorNpcAction* PickAction(FName Category) const;
+	// ro'yxatdagi birinchi mavjud kategoriyani o'ynaydi (yangi kategoriya hali klipsiz bo'lsa eskisiga qaytadi)
+	float DoFirst(const TArray<FName>& Categories, float Min, float Max);
 	FBozorCo FollowerLoop();
 	FBozorCo WalkerLoop();
 	FBozorCo SitDown();
 	FBozorCo Slide(FVector From, FVector To, float Time);
 	FBozorCo TalkerLoop();
-	FBozorCo WalkTo(FVector Target);
+	FBozorCo WalkTo(FVector Target, float Speed = 0.f);
 	FBozorCo TurnTo(FVector Forward);
 };
